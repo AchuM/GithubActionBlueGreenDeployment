@@ -1,0 +1,208 @@
+---
+name: build-deploy-blue-green
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '.github/workflows/**'
+
+env:
+  AWS_ACCOUNT_ID_QA: 123456789012
+  AWS_DEFAULT_REGION: us-west-2
+  AWS_DEFAULT_OUTPUT: json
+
+  HOSTED_ZONE_ID: Z123456789ABC1
+  ZONE_NAME: rest-service.qa.my-company.com.
+  ECS_CLUSTER: qa-default-01
+  SERVICE_BLUE: qa-rest-service-blue
+  SERVICE_GREEN: qa-rest-service-green
+  REPOSITORY_NAME: rest-service
+
+permissions:
+  id-token: write
+  contents: write
+  actions: read
+
+jobs:
+  notify-slack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials [QA]
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::$:role/qa-github-actions
+          aws-region: $
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "/devops/bastion/SLACK_WEBHOOK"
+          env_variable_name: "slack_webhook_url"
+
+      - uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          fields: workflow,job,commit,repo,ref,author,took
+          custom_payload: |
+            {
+              attachments: [{
+                color: '$' === 'success' ? 'good' : '$' === 'failure' ? 'danger' : 'warning',
+                text: `${process.env.AS_WORKFLOW}\n${process.env.AS_JOB} (${process.env.AS_COMMIT}) of ${process.env.AS_REPO}@${process.env.AS_REF} by ${process.env.AS_AUTHOR} $ in ${process.env.AS_TOOK}`,
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: $
+
+  build-blue-green:
+    needs: [notify-slack]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Configure AWS credentials [QA]
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::$:role/qa-github-actions-ecs
+          aws-region: $
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "/devops/bastion/SLACK_WEBHOOK"
+          env_variable_name: "slack_webhook_url"
+
+
+      - uses: tj-actions/changed-files@v15.1
+        id: changed-files-specific
+        with:
+          files: |
+            $${ env.REPOSITORY_NAME }}
+
+      - name: Build & push Docker image [QA]
+        if: steps.changed-files-specific.outputs.any_modified == 'true'
+        uses: mr-smithers-excellent/docker-build-push@v5
+        with:
+          image: $${ env.REPOSITORY_NAME }}
+          tags: latest, $
+          registry: $.dkr.ecr.$.amazonaws.com
+          directory: $${ env.REPOSITORY_NAME }}
+          dockerfile: $${ env.REPOSITORY_NAME }}/Dockerfile
+
+      - name: Login to Amazon ECR [QA]
+        id: login-ecr-qa
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Pull image from ECR [QA]
+        run: |
+          docker pull $/lacework-sidecar:latest
+
+      - name: Run shell commands
+        run: |
+          aws sts get-caller-identity
+          env | sort
+          ls -alF
+
+      - uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: $
+          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+        env:
+          SLACK_WEBHOOK_URL: $
+
+  deploy-blue-green:
+    needs: [notify-slack, build-blue-green]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get current date
+        id: get-current-date
+        run: echo "::set-output name=date::$(date +'%Y%m%d')"
+
+      - uses: actions/checkout@v2
+
+      - name: Configure AWS credentials [QA]
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          role-to-assume: arn:aws:iam::$:role/qa-github-actions-ecs
+          aws-region: $
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "/devops/bastion/SLACK_WEBHOOK"
+          env_variable_name: "slack_webhook_url"
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "/devops/github/PERSONAL_ACCESS_TOKEN"
+          env_variable_name: "ssm_github_token"
+
+      - uses: "marvinpinto/action-inject-ssm-secrets@latest"
+        with:
+          ssm_parameter: "/devops/github/ORGANIZATION"
+          env_variable_name: "ssm_github_organization"
+
+      - uses: actions/checkout@v2
+        with:
+          repository: $/devops-tools
+          path: ./devops-tools
+          token: $
+
+      - name: Get blue-green status [QA]
+        uses: "cwong47/action-deploy-ecs-blue-green@latest"
+        id: get-blue-green-info
+        with:
+          action: get-blue-green-info
+          hosted_zone_id: $
+          zone_name: $
+          ecs_service_blue: $
+          ecs_service_green: $
+          ecs_cluster: $
+
+      - name: Scale up original secondary cluster [QA]
+        uses: "cwong47/action-deploy-ecs-blue-green@latest"
+        id: update-secondary-autoscale-capacity
+        with:
+          action: update-autoscale-capacity
+          ecs_cluster: $
+          ecs_service: $
+          min_capacity: $
+          max_capacity: $
+
+      - name: Update Route53 weight for blue-green [QA]
+        uses: "cwong47/action-deploy-ecs-blue-green@latest"
+        id: update-primary-dns-weight
+        with:
+          action: update-dns-weight
+          hosted_zone_id: $
+          primary_route53_json: $
+          secondary_route53_json: $
+
+      - name: Scale down original primary cluster [QA]
+        uses: "cwong47/action-deploy-ecs-blue-green@latest"
+        id: update-primary-autoscale-capacity
+        with:
+          action: update-autoscale-capacity
+          ecs_cluster: $
+          ecs_service: $
+          min_capacity: $
+          max_capacity: $
+
+      - name: Associate Git tag to Commit ID [QA]
+        uses: rickstaa/action-create-tag@v1
+        with:
+          tag: build-deploy-blue-green-qa-release-$-$
+
+      - name: Run shell commands
+        run: |
+          aws sts get-caller-identity
+          env | sort
+          ls -alF
+
+      - uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: $
+          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+        env:
+          SLACK_WEBHOOK_URL: $
